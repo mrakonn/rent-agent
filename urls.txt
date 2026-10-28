@@ -1,0 +1,9 @@
+# Вставьте сюда ссылки с поиском (по одной на строку).
+# Как получить: на сайте задайте фильтры (СПб, аренда на длительный срок,
+# студия/1к/2к, цена до 55000, центр/метро), отсортируйте "по дате",
+# и скопируйте URL из адресной строки.
+# Строки с # игнорируются.
+
+# https://www.avito.ru/sankt-peterburg/kvartiry/sdam/na_dlitelnyy_srok-ASgBAgICAkSSA8gQ8AeQUg?pmax=55000&s=104
+# https://spb.cian.ru/cat.php?deal_type=rent&type=4&region=2&maxprice=55000&offer_type=flat
+# https://realty.yandex.ru/sankt-peterburg/snyat/kvartira/
