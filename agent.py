@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 import requests
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
@@ -28,7 +27,6 @@ BASE = Path(__file__).parent
 DB = sqlite3.connect(BASE / "seen.db")
 DB.execute("CREATE TABLE IF NOT EXISTS seen (id TEXT PRIMARY KEY, url TEXT)")
 DB.execute("CREATE TABLE IF NOT EXISTS sent (fp TEXT PRIMARY KEY)")
-client = Anthropic()
 
 # как выглядят ссылки на объявления на каждой площадке
 LINK_PATTERNS = {
@@ -36,29 +34,6 @@ LINK_PATTERNS = {
     "cian.ru": re.compile(r"^https://(?:spb\.)?cian\.ru/rent/flat/(\d+)"),
     "realty.yandex.ru": re.compile(r"^https://realty\.yandex\.ru/offer/(\d+)"),
 }
-
-PROMPT = """Ты помогаешь искать квартиру в аренду в Санкт-Петербурге. Ниже текст страницы объявления.
-Верни ТОЛЬКО JSON без пояснений:
-{{
- "is_rental_long_term": true/false,   // долгосрочная аренда (не посуточно)
- "rooms_type": "studio" | "1k" | "2k" | "other",  // студия/апарт-студия, 1-комн, 2-комн
- "rent": число в рублях в месяц или null,
- "deposit": "текст про залог" или null,
- "commission": "none" | "yes" | "unknown",  // комиссия агенту/собственнику
- "commission_note": "кратко" или null,
- "pets": "yes" | "no" | "unknown",
- "metro": "название станции" или null,
- "metro_minutes": число минут (пешком) или null,
- "address": "улица и дом" или null,
- "area_m2": число или null,
- "is_central": true/false,  // центр СПб: Центральный, Адмиралтейский, Петроградский, Василеостровский р-ны и близкие к ним
- "summary": "1 короткая фраза"
-}}
-Если данных нет, ставь null или "unknown", ничего не выдумывай.
-
-ТЕКСТ:
-{text}"""
-
 
 def tg(text: str):
     r = requests.post(
@@ -99,13 +74,79 @@ def page_text(page, url: str) -> str:
     return page.inner_text("body")[:7000]
 
 
+CENTRAL = ["центральн", "адмиралтейск", "петроградск", "василеостровск", "невский проспект",
+           "гостиный двор", "маяковская", "площадь восстания", "владимирская", "достоевская",
+           "пушкинская", "садовая", "сенная", "спасская", "чернышевская", "чкаловская",
+           "горьковская", "спортивная", "звенигородская", "технологический институт",
+           "лиговский", "площадь александра невского", "театральная", "василеостровская",
+           "старая деревня", "крестовский", "кирочная", "литейный", "фонтанка", "моховая"]
+NO_PETS = ["без животных", "без питомцев", "животных не", "питомцев не", "нельзя с животными",
+           "с животными нельзя", "с животными не", "животные не", "без домашних животных"]
+YES_PETS = ["можно с животными", "с животными можно", "с животными разреш", "животные разреш",
+            "с питомцами можно", "можно с питомцами", "можно с кошк", "можно с собак",
+            "допускается проживание с животными", "животные допускаются", "с животными: можно",
+            "с животными — можно"]
+NO_COMM = ["без комиссии", "комиссия 0", "комиссия: нет", "комиссия: 0", "комиссия отсутствует",
+           "без комисс", "без агент", "от собственника"]
+
+
 def analyze(text: str) -> dict:
-    resp = client.messages.create(
-        model=MODEL, max_tokens=600,
-        messages=[{"role": "user", "content": PROMPT.format(text=text)}],
-    )
-    raw = resp.content[0].text
-    return json.loads(raw[raw.index("{"): raw.rindex("}") + 1])
+    """Бесплатный разбор по ключевым словам (без нейросети)."""
+    t = text.lower()
+    head = text[:1500]
+    d = {"summary": next((l.strip() for l in text.splitlines() if len(l.strip()) > 10), "")[:120]}
+
+    d["is_rental_long_term"] = not ("посуточно" in t and "длительн" not in t)
+
+    if "студи" in t[:800] or "апарт" in t[:800]:
+        d["rooms_type"] = "studio"
+    else:
+        m = re.search(r"(\d)[\s\-]*(?:к\b|комн|-к\.)", t[:800])
+        n = m.group(1) if m else ("1" if "однокомн" in t[:800] else "2" if "двухкомн" in t[:800] else None)
+        d["rooms_type"] = {"1": "1k", "2": "2k"}.get(n, "other")
+
+    d["rent"] = None
+    for m in re.finditer(r"(\d[\d\s\u00a0\u202f]{3,8})\s*(?:₽|руб|р\.|р/)", head):
+        v = int(re.sub(r"\D", "", m.group(1)))
+        if 5000 <= v <= 500000:
+            d["rent"] = v
+            break
+
+    if any(k in t for k in NO_PETS):
+        d["pets"] = "no"
+    elif any(k in t for k in YES_PETS):
+        d["pets"] = "yes"
+    else:
+        d["pets"] = "unknown"
+
+    if any(k in t for k in NO_COMM):
+        d["commission"] = "none"
+    elif re.search(r"комисси\w*\W{0,3}[1-9]\d?\s*%", t) or re.search(r"комисси\w*\W{0,3}\d{4,}", t):
+        d["commission"] = "yes"
+    else:
+        d["commission"] = "unknown"
+    d["commission_note"] = None
+
+    m = re.search(r"залог[^\n.]{0,40}", t)
+    d["deposit"] = m.group(0).strip() if m else None
+
+    d["metro"], d["metro_minutes"] = None, None
+    m = re.search(r"(?:м\.|метро)\s*([А-ЯЁ][А-Яа-яё\-]+(?: [А-ЯЁа-яё\-]+)?)([^\n]{0,60})", text)
+    if m:
+        d["metro"] = m.group(1).strip()
+        tail = m.group(2)
+        mm = re.search(r"(\d{1,2})\s*мин", tail)
+        if mm and "транспорт" not in tail:
+            d["metro_minutes"] = int(mm.group(1))
+
+    m = re.search(r"Санкт-Петербург,\s*([^\n]{5,80})", text)
+    d["address"] = m.group(1).strip() if m else None
+
+    m = re.search(r"(\d{2,3}(?:[.,]\d)?)\s*м²", text)
+    d["area_m2"] = float(m.group(1).replace(",", ".")) if m else None
+
+    d["is_central"] = any(k in t for k in CENTRAL)
+    return d
 
 
 def is_match(d: dict) -> bool:
@@ -189,7 +230,9 @@ def run_once(ctx):
 
 
 def main():
-    tg("🏠 Агент поиска квартир запущен")
+    once = os.getenv("RUN_ONCE", "false").lower() == "true"
+    if not once:
+        tg("🏠 Агент поиска квартир запущен")
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             str(BASE / "browser_profile"), headless=HEADLESS, locale="ru-RU",
@@ -200,6 +243,8 @@ def main():
                 run_once(ctx)
             except Exception as e:
                 print(f"[!] ошибка цикла: {e}")
+            if once:
+                break
             time.sleep(INTERVAL_MIN * 60 + random.uniform(0, 120))
 
 
